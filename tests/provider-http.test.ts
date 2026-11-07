@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { boundedFetch, MAX_PROVIDER_RESPONSE_BYTES } from '../src/evaluation/http.ts';
-import { JevAdapter, ProviderError, duplicateAnswerKeys, type EvaluationBatch } from '../src/evaluation/jev.ts';
+import { ProviderError, type EvaluationBatch } from '../src/evaluation/contracts.ts';
+import { JevAdapter, duplicateAnswerKeys } from '../src/evaluation/jev.ts';
 import { OpenRouterAdapter, OPENROUTER_JEV_MODEL } from '../src/evaluation/openrouter.ts';
 import { VercelGatewayAdapter, VERCEL_JEV_MODEL } from '../src/evaluation/vercel-gateway.ts';
 import { createSearchEngine } from '../src/engine.ts';
 import { createWorkspace } from './helpers/search-workspace.ts';
 
-const batch: EvaluationBatch = { query: 'q "é"', items: [{ id: 'first', path: 'a.ts', startLine: 1, endLine: 1, text: 'a();\n' }] };
+const batch: EvaluationBatch = { query: 'q "é"', layout: 'layout-a-1', items: [{ id: 'first', path: 'a.ts', startLine: 1, endLine: 1, text: 'a();\n' }] };
 
 test('direct and OpenRouter transports send the prepared body without serializing again', async (t) => {
   for (const kind of ['direct', 'openrouter'] as const) {

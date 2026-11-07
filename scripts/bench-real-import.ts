@@ -10,11 +10,11 @@ import {
 
 const { values } = parseArgs({ options: {
   instances: { type: 'string' }, mirrors: { type: 'string' }, output: { type: 'string' }, revision: { type: 'string' },
-  'per-repo': { type: 'string' }, seed: { type: 'string' }, help: { type: 'boolean' },
+  'per-repo': { type: 'string' }, seed: { type: 'string' }, dataset: { type: 'string' }, version: { type: 'string' }, help: { type: 'boolean' },
 } });
 
 if (values.help || values.instances === undefined) {
-  console.log('npm run bench:real:import -- --instances swe-bench-test.jsonl [--revision <dataset-commit>] [--per-repo psf/requests=8,pallets/flask=4] [--mirrors benchmark-results/mirrors] [--output benchmarks/real-tasks/swe-bench-sample-1.json]');
+  console.log('npm run bench:real:import -- --instances swe-bench-test.jsonl [--revision <dataset-commit>] [--per-repo psf/requests=8,pallets/flask=4] [--mirrors benchmark-results/mirrors] [--output benchmarks/real-tasks/swe-bench-sample-1.json] [--dataset princeton-nlp/SWE-bench --version swe-bench-sample-1]');
 } else {
   const perRepository = Object.fromEntries((values['per-repo'] ?? 'psf/requests=8,pallets/flask=4').split(',').map((entry) => {
     const [name, count] = entry.split('=');
@@ -33,12 +33,12 @@ if (values.help || values.instances === undefined) {
     const built = await mapLimit(candidates, availableParallelism(), async (instance) =>
       buildTask(instance, await exportSnapshot(mirrors.get(repository)!, repository, instance.base_commit), selection.maxEditFiles, selection.maxQueryBytes));
     const chosen = built.filter((task) => task !== null).slice(0, perRepository[repository]);
-    if (chosen.length < perRepository[repository]) throw new Error(`${repository}: only ${chosen.length} eligible tasks`);
+    if (chosen.length < perRepository[repository]) console.error(`${repository}: only ${String(chosen.length)} eligible tasks of ${String(perRepository[repository])} requested`);
     tasks.push(...chosen);
   }
   const manifest: RealManifest = {
-    version: 'swe-bench-sample-1',
-    source: { dataset: 'princeton-nlp/SWE-bench', split: 'test', license: 'MIT (dataset); issue text and code from the upstream repositories', revision: values.revision ?? null },
+    version: values.version ?? 'swe-bench-sample-1',
+    source: { dataset: values.dataset ?? 'princeton-nlp/SWE-bench', split: 'test', license: 'MIT (dataset); issue text and code from the upstream repositories', revision: values.revision ?? null },
     selection, tasks,
   };
   const path = writeReport(values.output ?? manifestPath, manifest);

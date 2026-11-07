@@ -17,24 +17,28 @@
 import { countReferenceTokens } from '../response/token-counter.ts';
 import { measureSync } from '../profiling.ts';
 import { parseJavaBoundaries } from './java-boundaries.ts';
-import { parseJavaScriptBoundaries } from './javascript-boundaries.ts';
+import { planJavaScriptRanges } from './javascript-chunker.ts';
+import type { JavaScriptContextPolicy } from './javascript-chunker.ts';
 import type { ParseOutcome } from './javascript-boundaries.ts';
 import { parsePythonBoundaries } from './python-boundaries.ts';
 import type { Boundary } from './javascript-boundaries.ts';
 import { DEFAULT_WINDOW_LIMITS, LINE_WINDOW_CHUNKER_VERSION, lineWindowsOf } from './line-windows.ts';
 import type { FragmentWindow, UnsupportedLongLine, WindowLimits } from './line-windows.ts';
 import type { SourceSnapshot } from './snapshot.ts';
+import { TREE_SITTER_GRAMMARS, parseTreeSitterBoundaries } from './tree-sitter-boundaries.ts';
 
 export { DEFAULT_WINDOW_LIMITS, LINE_WINDOW_CHUNKER_VERSION };
 export type { WindowLimits };
 
-export type SyntaxLanguage = 'javascript' | 'python' | 'java';
+export type SyntaxLanguage = 'javascript' | 'python' | 'java' | 'go' | 'rust';
 
 /** Bumped per language when its syntax boundaries change; part of evaluation identity (JG-018). */
 export const SYNTAX_CHUNKER_VERSIONS: Readonly<Record<SyntaxLanguage, string>> = {
-  javascript: 'jevgrep-typescript-6.0.2-2',
+  javascript: 'jevgrep-typescript-6.0.2-3',
   python: 'jevgrep-python-scan-1',
   java: 'jevgrep-java-scan-1',
+  go: `jevgrep-${TREE_SITTER_GRAMMARS.go}-1`,
+  rust: `jevgrep-${TREE_SITTER_GRAMMARS.rust}-1`,
 };
 
 export const SYNTAX_CHUNKER_VERSION = SYNTAX_CHUNKER_VERSIONS.javascript;
@@ -49,6 +53,8 @@ export const SYNTAX_CHUNKER_VERSION = SYNTAX_CHUNKER_VERSIONS.javascript;
 export type PreparedFragment = Omit<FragmentWindow, 'classification'> & {
   readonly classification: 'line-window' | 'syntax-range';
   readonly label?: string | null;
+  /** The declaration this window was cut from, when one declaration became several windows. */
+  readonly declaration?: { readonly startLine: number; readonly endLine: number } | null;
 };
 
 export type ChunkFallback = 'parse_failure';
@@ -68,6 +74,8 @@ const SYNTAX_LANGUAGES: ReadonlyMap<string, SyntaxLanguage> = new Map([
   ['.py', 'python'],
   ['.pyi', 'python'],
   ['.java', 'java'],
+  ['.go', 'go'],
+  ['.rs', 'rust'],
 ]);
 
 export function extensionOf(path: string): string {
@@ -81,20 +89,21 @@ export function syntaxLanguageOf(path: string): SyntaxLanguage | null {
   return SYNTAX_LANGUAGES.get(extensionOf(path)) ?? null;
 }
 
-/** True for the JS/TS, Python and Java extensions the syntax chunker attempts. */
+/** True for the JS/TS, Python, Java, Go and Rust extensions the syntax chunker attempts. */
 export function usesSyntaxChunking(path: string): boolean {
   return syntaxLanguageOf(path) !== null;
 }
 
-function parseBoundaries(language: SyntaxLanguage, snapshot: SourceSnapshot): ParseOutcome {
+function parseBoundaries(language: Exclude<SyntaxLanguage, 'javascript'>, snapshot: SourceSnapshot): ParseOutcome {
   const lineOfOffset = (offset: number): number => snapshot.lineOfUtf16(offset);
   switch (language) {
-    case 'javascript':
-      return parseJavaScriptBoundaries(snapshot.text, lineOfOffset, snapshot.relativePath);
     case 'python':
       return parsePythonBoundaries(snapshot.text, lineOfOffset);
     case 'java':
       return parseJavaBoundaries(snapshot.text, lineOfOffset);
+    case 'go':
+    case 'rust':
+      return parseTreeSitterBoundaries(language, snapshot.text);
   }
 }
 
@@ -157,6 +166,7 @@ function windowsOfRange(
   range: LineRange,
   limits: WindowLimits,
   chunker: string,
+  labelEveryWindow = false,
 ): PreparedFragment[] | UnsupportedLongLine {
   const fragments: PreparedFragment[] = [];
   let cursor = range.startLine;
@@ -179,9 +189,13 @@ function windowsOfRange(
       end += 1;
     }
     if (!isBlankRange(snapshot, cursor, end)) {
-      fragments.push(fragmentOf(snapshot, {
-        startLine: cursor, endLine: end, label: cursor === range.startLine ? range.label : null,
-      }, chunker));
+      const split = cursor > range.startLine || end < range.endLine;
+      fragments.push({
+        ...fragmentOf(snapshot, {
+          startLine: cursor, endLine: end, label: labelEveryWindow || cursor === range.startLine ? range.label : null,
+        }, chunker),
+        ...(split ? { declaration: { startLine: range.startLine, endLine: range.endLine } } : {}),
+      });
     }
     if (end >= range.endLine) {
       break;
@@ -274,7 +288,7 @@ function packUnits(
 }
 
 /** Whole-file line windows, produced by the JG-012 chunker and relabelled for this shape. */
-function fallbackWindows(snapshot: SourceSnapshot, limits: WindowLimits): ChunkResult {
+export function fallbackWindows(snapshot: SourceSnapshot, limits: WindowLimits): ChunkResult {
   const result = lineWindowsOf(
     { path: snapshot.relativePath, text: snapshot.text, sha256: snapshot.sha256 },
     snapshot,
@@ -287,16 +301,38 @@ function fallbackWindows(snapshot: SourceSnapshot, limits: WindowLimits): ChunkR
   return { kind: 'fragments', strategy: 'line-window', fallback: null, fragments: result.windows };
 }
 
+/** The preparation seam: a cache identity per path and the chunker that matches it. */
+export type SnapshotChunker = {
+  readonly identity: (relativePath: string) => string;
+  readonly chunk: (snapshot: SourceSnapshot, limits: WindowLimits) => ChunkResult;
+};
+
+export const DEFAULT_CHUNKER: SnapshotChunker = Object.freeze({
+  identity: chunkerIdentityFor,
+  chunk: (snapshot: SourceSnapshot, limits: WindowLimits) => chunkSnapshot(snapshot, limits),
+});
+
+export type ChunkOptions = {
+  /**
+   * JS/TS label policy, the E1 metadata variable. `local` (default) labels a range with the
+   * symbol it starts; `enclosing` and `compact` add the enclosing chain and measured no better.
+   */
+  readonly javascriptContext?: JavaScriptContextPolicy;
+};
+
 /**
  * Prepare every fragment of one snapshot.
  *
- * Text in other languages uses JG-012 directly. JS/TS, Python and Java text is
- * parsed for statement boundaries; if the parser refuses the file, the same JG-012 windows are returned
- * with `fallback: 'parse_failure'` so the caller can report it.
+ * Text in other languages uses JG-012 directly. JS/TS text is split recursively along
+ * its syntax tree; Python, Java, Go and Rust text is parsed for statement boundaries. If the
+ * parser refuses the file, the same JG-012 windows are returned with
+ * `fallback: 'parse_failure'` so the caller can report it. A JS/TS file whose syntax
+ * errors stay local keeps its structure elsewhere and also reports `parse_failure`.
  */
 export function chunkSnapshot(
   snapshot: SourceSnapshot,
   limits: WindowLimits = DEFAULT_WINDOW_LIMITS,
+  options: ChunkOptions = {},
 ): ChunkResult {
   // Every chunker rejects a line above the byte ceiling; find it before parsing or BPE work.
   // Blank-only files carry no fragment, so they never reach this refusal.
@@ -311,17 +347,56 @@ export function chunkSnapshot(
   if (language === null) {
     return fallbackWindows(snapshot, limits);
   }
+  if (language === 'javascript') {
+    return chunkJavaScript(snapshot, limits, options.javascriptContext ?? 'local');
+  }
 
   const chunker = SYNTAX_CHUNKER_VERSIONS[language];
   const scan = measureSync('parsing', () => parseBoundaries(language, snapshot));
   if (!scan.ok) {
-    const windows = fallbackWindows(snapshot, limits);
-    return windows.kind === 'unsupported-long-line'
-      ? windows
-      : { ...windows, fallback: 'parse_failure' };
+    return parseFailure(snapshot, limits);
   }
+  return chunkWithBoundaries(snapshot, scan.boundaries, limits, chunker);
+}
 
-  const { boundaries } = scan;
+function parseFailure(snapshot: SourceSnapshot, limits: WindowLimits): ChunkResult {
+  const windows = fallbackWindows(snapshot, limits);
+  return windows.kind === 'unsupported-long-line' ? windows : { ...windows, fallback: 'parse_failure' };
+}
+
+function chunkJavaScript(snapshot: SourceSnapshot, limits: WindowLimits, context: JavaScriptContextPolicy): ChunkResult {
+  const chunker = SYNTAX_CHUNKER_VERSIONS.javascript;
+  const plan = measureSync('parsing', () => planJavaScriptRanges(snapshot, limits, context));
+  if (!plan.ok) {
+    return parseFailure(snapshot, limits);
+  }
+  const fragments: PreparedFragment[] = [];
+  for (const range of plan.ranges) {
+    if (range.windows || snapshot.rangeTokens(range.startLine, range.endLine) > limits.maxTokens
+      || snapshot.rangeBytes(range.startLine, range.endLine) > limits.maxBytes
+      || range.endLine - range.startLine + 1 > limits.maxLines) {
+      const windows = windowsOfRange(snapshot, range, limits, chunker, range.labelEveryWindow);
+      if (!Array.isArray(windows)) {
+        return windows;
+      }
+      fragments.push(...windows);
+    } else if (!isBlankRange(snapshot, range.startLine, range.endLine)) {
+      fragments.push(fragmentOf(snapshot, range, chunker));
+    }
+  }
+  return { kind: 'fragments', strategy: 'syntax', fallback: plan.recovered ? 'parse_failure' : null, fragments };
+}
+
+/**
+ * Depth-indexed boundary packing, used by the Python and Java scanners and kept as the
+ * previous JS/TS policy for the E1 comparison.
+ */
+export function chunkWithBoundaries(
+  snapshot: SourceSnapshot,
+  boundaries: readonly Boundary[],
+  limits: WindowLimits,
+  chunker: string,
+): ChunkResult {
   const maxRefineDepth = 2;
   const refineAt = (depth: number) => (unit: LineRange): PreparedFragment[] | UnsupportedLongLine | null => {
     if (depth > maxRefineDepth) {

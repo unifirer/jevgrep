@@ -3,6 +3,9 @@ import {
   object, refine, requireContract, schema, textValue,
 } from './contract-schema.ts';
 import type { Infer } from './contract-schema.ts';
+import { checkRelativePath } from './path-policy.ts';
+import type { RelativePathViolation } from './path-policy.ts';
+import { MAX_CONTINUATION_TOKEN_LENGTH } from './continuation.ts';
 export { ContractValidationError } from './contract-schema.ts';
 
 export const SCHEMA_VERSION = '1';
@@ -12,12 +15,16 @@ export const CONTRACT_LIMITS = Object.freeze({
   scope_entries: 32,
   scope_bytes: 4_096,
   min_response_tokens: 1_024,
-  default_response_tokens: 4_000,
+  default_response_tokens: 8_000,
   max_response_tokens: 16_000,
   error_bytes: 4_096,
   error_tokens: 1_024,
   diagnostic_events: 64,
 });
+
+/** Local selection orders (roadmap section 8); `relevance` is the default. */
+export const SELECTION_POLICIES = ['relevance', 'mmr', 'marginal'] as const;
+export type SelectionPolicy = typeof SELECTION_POLICIES[number];
 
 export const SCAN_CAP_KEYS = [
   'estimated_cost_usd', 'estimated_input_tokens', 'transmitted_bytes',
@@ -76,22 +83,23 @@ const usd = refine(numberValue(0, Number.MAX_SAFE_INTEGER / 1_000_000_000, false
   path, 'USD amounts must be representable as integer nanodollars');
 });
 const identifier = refine(textValue(128), (value, path) => {
-  requireContract(/^[A-Za-z0-9][A-Za-z0-9._:@/+\-]*$/.test(value), path, 'expected a bounded identifier');
+  requireContract(/^[A-Za-z0-9][A-Za-z0-9._:@/+-]*$/.test(value), path, 'expected a bounded identifier');
 });
 const version = literal(SCHEMA_VERSION);
 const responseTokens = numberValue(CONTRACT_LIMITS.min_response_tokens, Number.MAX_SAFE_INTEGER);
 
+const PATH_VIOLATION_MESSAGES: Readonly<Record<RelativePathViolation, string>> = {
+  absolute: 'absolute and namespace paths are forbidden',
+  syntax: 'unsupported path syntax',
+  traversal: 'parent traversal is forbidden',
+  trailing: 'ambiguous trailing path characters',
+  device: 'device names are forbidden',
+};
+
 function normalizedPath(input: string, path: string): string {
-  requireContract(!/^[\\/]/.test(input), path, 'absolute and namespace paths are forbidden');
-  requireContract(!/[\u0000-\u001f\u007f<>:"|?*]/.test(input), path, 'unsupported path syntax');
-  const segments = input.replaceAll('\\', '/').split('/');
-  requireContract(!segments.includes('..'), path, 'parent traversal is forbidden');
-  const parts = segments.filter((part) => part !== '' && part !== '.');
-  for (const part of parts) {
-    requireContract(!/[. ]$/.test(part), path, 'ambiguous trailing path characters');
-    requireContract(!/^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part), path, 'device names are forbidden');
-  }
-  return parts.join('/') || '.';
+  const checked = checkRelativePath(input);
+  if (!checked.ok) requireContract(false, path, PATH_VIOLATION_MESSAGES[checked.violation]);
+  return checked.normalized;
 }
 
 const scopePath = refine(textValue(CONTRACT_LIMITS.scope_bytes), (value, path) => {
@@ -130,20 +138,33 @@ export function createSearchRequestSchema(limits: ResponseLimits = defaultRespon
     scope: scopeSchema,
     max_context_tokens: numberValue(CONTRACT_LIMITS.min_response_tokens, limits.max_response_tokens),
     allow_partial_scan: booleanValue,
+    continuation: textValue(MAX_CONTINUATION_TOKEN_LENGTH),
+    // Search budgets of one call: each one implies a partial scan when it is reached,
+    // reported as such with a continuation. They never raise an operator's cap.
+    max_input_tokens: positiveCount,
+    max_cost_usd: usd,
+    max_search_ms: positiveCount,
   });
 }
 export const searchRequestSchema = createSearchRequestSchema();
 export type SearchRequest = Infer<typeof searchRequestSchema>;
-export type ResolvedSearchRequest = Required<SearchRequest>;
+export type SearchBudgetField = 'max_input_tokens' | 'max_cost_usd' | 'max_search_ms';
+export type ResolvedSearchRequest = Required<Omit<SearchRequest, 'continuation' | SearchBudgetField>> & Pick<SearchRequest, 'continuation' | SearchBudgetField>;
 
 /** Pure lexical validation. Filesystem authorization remains the source reader's job. */
 export function parseSearchRequest(input: unknown, limits: ResponseLimits = defaultResponseLimits): ResolvedSearchRequest {
   const request = createSearchRequestSchema(limits).parse(input);
+  const budgeted = request.max_input_tokens !== undefined || request.max_cost_usd !== undefined || request.max_search_ms !== undefined;
   return {
     query: request.query,
     scope: normalizeScope(request.scope ?? ['.']),
     max_context_tokens: request.max_context_tokens ?? limits.default_response_tokens,
-    allow_partial_scan: request.allow_partial_scan ?? false,
+    // A caller who names a budget accepts the partial result it may produce.
+    allow_partial_scan: request.allow_partial_scan ?? budgeted,
+    ...(request.continuation === undefined ? {} : { continuation: request.continuation }),
+    ...(request.max_input_tokens === undefined ? {} : { max_input_tokens: request.max_input_tokens }),
+    ...(request.max_cost_usd === undefined ? {} : { max_cost_usd: request.max_cost_usd }),
+    ...(request.max_search_ms === undefined ? {} : { max_search_ms: request.max_search_ms }),
   };
 }
 
@@ -177,6 +198,7 @@ const pricingSchema = object({
 export const configurationSchema = refine(object({
   schema_version: literal(CONFIG_SCHEMA_VERSION),
   repository_root: refine(textValue(4_096), (value, path) => {
+    // oxlint-disable-next-line no-control-regex -- control characters are rejected on purpose
     requireContract(!/[\u0000-\u001f\u007f]/.test(value), path, 'control characters are forbidden');
     requireContract((value.startsWith('/') && !value.startsWith('//')) || /^[A-Za-z]:[\\/]/.test(value),
       path, 'expected an absolute POSIX or Windows drive path');
@@ -204,6 +226,7 @@ export const configurationSchema = refine(object({
     max_response_tokens: responseTokens,
     threshold: probability,
   }, {
+    selection_policy: enumeration(SELECTION_POLICIES),
     retry: refine(object({
       max_retries: numberValue(0, 10),
       base_delay_ms: numberValue(1, 60_000),
@@ -260,7 +283,7 @@ export function createDefaultConfiguration(repositoryRoot: string, model: string
       adapter: 'typesafe-direct', base_url: 'https://api.typesafe.ai',
       api_key_env: 'TYPESAFE_API_KEY', model,
     },
-    search: { deadline_ms: 300_000, concurrency: 4, require_fit: true, ...defaultResponseLimits, threshold: 0.5 },
+    search: { deadline_ms: 300_000, concurrency: 16, require_fit: true, ...defaultResponseLimits, threshold: 0.5 },
     scan_caps: Object.fromEntries(SCAN_CAP_KEYS.map((key) => [key, null])),
     source: { respect_gitignore: true, follow_links: false, max_file_bytes: 1_048_576, extra_deny_globs: [] },
     cache: { enabled: true, ttl_seconds: 604_800, max_bytes: 104_857_600 },
@@ -322,6 +345,11 @@ const resultShape = object({
     stop_reasons: array(enumeration(STOP_REASONS), 0, STOP_REASONS.length),
     diagnostics_truncated: booleanValue,
   }),
+}, {
+  continuation: object({
+    next: nullable(textValue(MAX_CONTINUATION_TOKEN_LENGTH)),
+    previously_delivered_omitted: count,
+  }),
 });
 export type SearchResult = Infer<typeof resultShape>;
 export type Excerpt = SearchResult['excerpts'][number];
@@ -332,6 +360,23 @@ function sum(values: number[], path: string): number {
   return Number(total);
 }
 
+type SearchReport = SearchResult['report'];
+
+type ResultFacts = {
+  readonly value: SearchResult;
+  readonly path: string;
+  readonly check: (condition: boolean, rule: string) => void;
+  readonly report: SearchReport;
+  readonly files: SearchReport['files'];
+  readonly f: SearchReport['fragments'];
+  readonly selection: SearchReport['selection'];
+  readonly u: SearchReport['usage'];
+  readonly p: SearchReport['preflight'];
+  readonly reasons: SearchReport['stop_reasons'];
+  readonly evaluated: number;
+  readonly knownTotal: number;
+};
+
 function validateResult(value: SearchResult, path: string): void {
   const { files, fragments: f, selection, usage: u, preflight: p, stop_reasons: reasons } = value.report;
   const report = value.report;
@@ -339,8 +384,9 @@ function validateResult(value: SearchResult, path: string): void {
   const evaluated = sum([f.remote_evaluated, f.cache_reused], path);
   const knownTotal = sum([evaluated, f.not_evaluated], path);
   check(evaluated === sum([f.below_threshold, f.above_threshold], path), 'successful evaluations must equal threshold categories');
-  check(f.above_threshold === sum([f.represented_in_response, f.omitted_by_response_budget, f.omitted_stale], path),
-    'qualifying fragments must equal represented, budget-omitted and stale categories');
+  const deliveredBefore = value.continuation?.previously_delivered_omitted ?? 0;
+  check(f.above_threshold === sum([f.represented_in_response, f.omitted_by_response_budget, f.omitted_stale, deliveredBefore], path),
+    'qualifying fragments must equal represented, budget-omitted, stale and previously delivered categories');
   check(f.total === null || f.total === knownTotal, 'fragment total does not match terminal categories');
   check(report.inventory_complete || f.total === null, 'incomplete inventory requires an unknown fragment total');
   check(files.unreadable === 0 || f.total === null, 'unreadable source prevents a known prepared total');
@@ -356,6 +402,15 @@ function validateResult(value: SearchResult, path: string): void {
   check(selection.duplicate_ranges_collapsed <= f.above_threshold, 'collapsed duplicates exceed qualifying fragments');
   check(new Set(reasons).size === reasons.length, 'stop reasons must be unique');
 
+  const facts: ResultFacts = { value, path, check, report, files, f, selection, u, p, reasons, evaluated, knownTotal };
+  checkStatus(facts);
+  checkExcerpts(facts);
+  checkUsage(facts);
+  checkPreflight(facts);
+}
+
+/** Status, stop reasons and the empty-selection outcome agree. */
+function checkStatus({ value, check, report, files, f, selection, u, p, reasons, evaluated }: ResultFacts): void {
   const canBeComplete = report.inventory_complete && f.total !== null && f.not_evaluated === 0
     && files.unreadable === 0 && files.changed_before_return === 0;
   check(!report.scope_fully_scanned || canBeComplete, 'full coverage contradicts inventory, evaluations or freshness');
@@ -392,7 +447,10 @@ function validateResult(value: SearchResult, path: string): void {
     : f.above_threshold === 0 ? 'no_score_above_threshold'
     : f.omitted_stale === f.above_threshold ? 'no_fresh_excerpt' : 'no_excerpt_fits';
   check(selection.outcome === expectedSelection, 'selection outcome violates empty-selection precedence');
+}
 
+/** Returned excerpts are unique, in scope, above threshold and one snapshot per file. */
+function checkExcerpts({ value, check, report, files, selection }: ResultFacts): void {
   const seenRanges = new Set<string>();
   const hashes = new Map<string, string>();
   for (const excerpt of value.excerpts) {
@@ -406,7 +464,10 @@ function validateResult(value: SearchResult, path: string): void {
     seenRanges.add(key);
   }
   check(hashes.size <= files.eligible, 'returned files exceed eligible files');
+}
 
+/** Usage accounting is internally consistent. */
+function checkUsage({ path, check, f, u, reasons }: ResultFacts): void {
   check(u.attempts_with_unknown_usage <= u.provider_request_attempts, 'unknown attempts exceed dispatched attempts');
   check(u.provider_input_tokens_reported === (u.attempts_with_unknown_usage === 0 ? u.provider_input_tokens_known_subtotal : null),
     'all-attempt usage must be null if any attempt has unknown usage');
@@ -424,7 +485,10 @@ function validateResult(value: SearchResult, path: string): void {
       && (u.estimated_cost_usd === null || u.estimated_cost_usd === 0)
       && (u.reported_cost_usd === null || u.reported_cost_usd === 0), 'zero-call searches cannot report incurred usage');
   }
+}
 
+/** The preflight plan matches the prepared totals and justifies any rejection. */
+function checkPreflight({ value, path, check, f, p, reasons }: ResultFacts): void {
   const enabledKeys = Object.keys(p.enabled_caps).sort();
   check(JSON.stringify(enabledKeys) === JSON.stringify(Object.keys(p.estimated_required_caps).sort()), 'cap maps must have exactly the same keys');
   if (f.total !== null) {

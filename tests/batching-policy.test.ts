@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildBatches } from '../src/engine.ts';
-import { buildRequestPayload, type EvaluationBatch } from '../src/evaluation/jev.ts';
+import { buildBatches, buildBatchesAsync } from '../src/planning.ts';
+import type { EvaluationBatch } from '../src/evaluation/contracts.ts';
+import { buildRequestPayload } from '../src/evaluation/jev.ts';
 import { batchLimits, fitsSerializedBatch, measureSerializedBatch, scoreCachePolicy } from '../src/evaluation/policy.ts';
 import { serializeGatewayBatch } from '../src/evaluation/vercel-gateway.ts';
 import { countReferenceTokens } from '../src/response/token-counter.ts';
@@ -59,9 +60,27 @@ test('premeasured singleton questions and final batch costs keep exact payload l
     onBatchMeasure: (_batch, cost) => measurements.push(cost),
   });
   assert.deepEqual(batches.map((batch) => batch.items.length), [4]);
-  assert.equal(serializations, 3, 'only the three growing batch candidates are serialized');
+  assert.equal(serializations, 2, 'one serialization reads the shared state, one measures the final batch exactly');
   const body = serializeDirect(batches[0]!);
   assert.deepEqual(measurements, [{ tokens: countReferenceTokens(body), bytes: Buffer.byteLength(body), fits: true }]);
+});
+
+test('batching tokenizes the wire body once per batch, not once per added question', () => {
+  const fragments = Array.from({ length: 400 }, (_, i) => fragment(i, `const value${i} = ${'x'.repeat(200)};`));
+  const query = 'Find value';
+  const limits = batchLimits();
+  let serializations = 0;
+  let measured = 0;
+  const batches = buildBatches(fragments, query, {
+    serialize: (batch) => { serializations++; return serializeDirect(batch); }, limits,
+    onBatchMeasure: (batch, measure) => { measured++; assert.ok(measure.fits); assert.equal(measure.tokens, countReferenceTokens(serializeDirect(batch))); },
+  });
+  assert.ok(batches.length >= 7 && batches.length <= 8, `${batches.length} batches`);
+  assert.equal(measured, batches.length);
+  assert.ok(batches.every((batch) => fitsSerializedBatch(serializeDirect(batch), limits)));
+  assert.deepEqual(batches.flatMap((batch) => batch.items.map((item) => item.id)), fragments.map((item) => item.id));
+  // singletons (400) + state (1) + final measure per batch + a few exact checks near each limit
+  assert.ok(serializations < 400 + 1 + batches.length * 6, `${serializations} serializations`);
 });
 
 test('new direct profiles are pinned; rolling reuse is bounded, optional and adapter-specific', () => {
@@ -73,4 +92,27 @@ test('new direct profiles are pinned; rolling reuse is bounded, optional and ada
   assert.equal(scoreCachePolicy('typesafe-direct', 'typesafe-ai/jev', cache).mode, 'disabled');
   assert.equal(scoreCachePolicy('vercel-ai-gateway', 'typesafe-ai/jev', { ...cache, rolling_ttl_seconds: 0 }).mode, 'disabled');
   assert.equal(scoreCachePolicy('vercel-ai-gateway', 'typesafe-ai/jev', { ...cache, enabled: false }).mode, 'disabled');
+});
+
+test('batches built with pool workers are the batches built on the calling thread', () => {
+  const fragments = Array.from({ length: 600 }, (_, i) => fragment(i, `const value${i} = "${'word '.repeat(60 + (i % 37))}";`));
+  const query = 'Find value';
+  const limits = batchLimits();
+  const sequential = buildBatches(fragments, query, { serialize: serializeDirect, limits, threads: 0 });
+  const pooled = buildBatches(fragments, query, { serialize: serializeDirect, limits, threads: 2 });
+  assert.deepEqual(pooled.map((batch) => batch.items.map((item) => item.id)), sequential.map((batch) => batch.items.map((item) => item.id)));
+  assert.ok(sequential.length > 5);
+  assert.ok(sequential.every((batch) => fitsSerializedBatch(serializeDirect(batch), limits)));
+});
+
+test('batches built asynchronously on the pool are the batches built synchronously, and an abort stops the wait', async () => {
+  const fragments = Array.from({ length: 600 }, (_, i) => fragment(i, `const value${i} = "${'word '.repeat(60 + (i % 37))}";`));
+  const query = 'Find value';
+  const limits = batchLimits();
+  const sequential = buildBatches(fragments, query, { serialize: serializeDirect, limits, threads: 0 });
+  const asynchronous = await buildBatchesAsync(fragments, query, { serialize: serializeDirect, limits, threads: 2 });
+  assert.deepEqual(asynchronous.map((batch) => batch.items.map((item) => item.id)), sequential.map((batch) => batch.items.map((item) => item.id)));
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(buildBatchesAsync(fragments, query, { serialize: serializeDirect, limits, threads: 2, signal: controller.signal }), /aborted/);
 });

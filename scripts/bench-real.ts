@@ -1,20 +1,23 @@
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { createSearchEngine } from '../src/engine.ts';
 import { SearchProfiler } from '../src/profiling.ts';
 import { environment, positiveInteger, projectRoot, workspace, writeReport } from './bench/common.ts';
 import { assertFrozen, digest, writeFreeze } from './bench/freeze.ts';
 import { liveProvider } from './bench/live-provider.ts';
-import { loadManifest, mapLimit, type RealSplit } from './bench/real-tasks.ts';
+import { chunkingArm } from './bench/chunking-arms.ts';
+import { hardManifestPath, javascriptManifestPath, loadManifest, mapLimit, systemsManifestPath, type RealSplit } from './bench/real-tasks.ts';
 import { loadSnapshots } from './bench/snapshots.ts';
 import { groupBy, mean, plannedSummary } from './bench/report.ts';
 import { localizationMetrics } from './bench/retrieval.ts';
+import { writeCapture } from './bench/replay.ts';
+import type { CapturedPool } from './bench/replay.ts';
 
 const { values } = parseArgs({ options: {
   config: { type: 'string' }, split: { type: 'string' }, output: { type: 'string' }, mirrors: { type: 'string' },
   frozen: { type: 'string' }, freeze: { type: 'string' }, jobs: { type: 'string' }, only: { type: 'string' },
   'max-requests': { type: 'string' }, 'max-input-tokens': { type: 'string' }, 'response-tokens': { type: 'string' },
-  'validate-only': { type: 'boolean' }, help: { type: 'boolean' },
+  capture: { type: 'string' }, 'validate-only': { type: 'boolean' }, help: { type: 'boolean' }, javascript: { type: 'boolean' }, 'go-rust': { type: 'boolean' }, hard: { type: 'boolean' }, manifest: { type: 'string' }, chunker: { type: 'string' },
 } });
 
 type Planned = { id: string; category: string; repository: string };
@@ -40,10 +43,18 @@ if (values.help) {
     'npm run bench:real -- --validate-only',
     'npm run bench:real -- --config <trusted-config> --split dev [--jobs 1] [--max-requests 400] [--output benchmark-results/real-dev.json]',
     'npm run bench:real -- --config <trusted-config> --split heldout --freeze benchmark-results/real-heldout.freeze.json',
+    'npm run bench:real -- --javascript --chunker line-windows|typescript-v2|recursive|recursive-compact|recursive-enclosing --config <trusted-config> --split dev   (E1)',
+    'npm run bench:real -- --go-rust --chunker go-rust-line-windows|recursive --config <trusted-config> --split dev   (Go/Rust syntax chunking)',
     'npm run bench:real -- --config <trusted-config> --split heldout --frozen benchmark-results/real-heldout.freeze.json',
   ].join('\n'));
 } else {
-  const manifest = loadManifest();
+  // The JS/TS (E1) and Go/Rust manifests have no audit file; their labels come from the patches alone.
+  const manifest = values.javascript ? loadManifest(javascriptManifestPath, {})
+    : values['go-rust'] ? loadManifest(systemsManifestPath, {})
+    : values.hard ? loadManifest(hardManifestPath, {})
+    : values.manifest !== undefined ? loadManifest(resolve(values.manifest), {}) : loadManifest();
+  const chunkerArm = values.chunker ?? 'recursive';
+  const chunker = chunkingArm(chunkerArm);
   const split = (values.split ?? 'dev') as RealSplit;
   if (split !== 'dev' && split !== 'heldout') throw new Error('--split must be dev or heldout');
   const only = values.only?.split(',');
@@ -60,7 +71,7 @@ if (values.help) {
     const responseTokens = positiveInteger(values['response-tokens'], 4_000);
     if (responseTokens > live.template.config.search.max_response_tokens) throw new Error('response budget exceeds trusted configuration maximum');
     const host = environment();
-    const settings = { provider: live.settings, search: live.template.config.search, scanCaps: live.template.config.scan_caps, responseTokens, caps: live.caps, scoreCache: 'disabled' };
+    const settings = { provider: live.settings, search: live.template.config.search, scanCaps: live.template.config.scan_caps, responseTokens, caps: live.caps, scoreCache: 'disabled', chunker: chunkerArm };
     const identity = {
       split, datasetHash: digest(tasks), sourceHash: host.sourceHash, harnessHash: host.harnessHash,
       packageLockHash: host.packageLockHash, settingsHash: digest(settings), model: live.provider.model,
@@ -71,6 +82,7 @@ if (values.help) {
       const frozen = split === 'heldout' ? assertFrozen(values.frozen, identity) : null;
       const planned = queries.map(({ task, query }) => ({ id: query.id, category: query.category, repository: task.repository }));
       const notRun: string[] = [];
+      const pools: CapturedPool[] = [];
       const rows = (await mapLimit(queries, positiveInteger(values.jobs, 1), async ({ task, query }) => {
         if (live.exhausted()) { notRun.push(query.id); return null; }
         console.error(`Real ${query.id}`);
@@ -78,9 +90,9 @@ if (values.help) {
         const started = performance.now();
         try {
           const profile = new SearchProfiler();
-          const result = await createSearchEngine({ configuration: space.loaded, provider: live.provider }).search({
+          const result = await createSearchEngine({ configuration: space.loaded, provider: live.provider, chunker }).search({
             query: query.query, scope: ['.'], max_context_tokens: responseTokens,
-          }, { searchId: query.id, profile });
+          }, { searchId: query.id, profile, onCandidatePool: (pool) => { pools.push({ id: query.id, source: task.id, pool }); } });
           const metrics = localizationMetrics(query, result.outcome);
           console.error(`  ${query.id} ${'report' in result.outcome ? result.outcome.status : 'error'} R@5=${metrics?.recallAt5 ?? '-'}`);
           return {
@@ -109,6 +121,7 @@ if (values.help) {
         usage: live.usage, summary: { ...summarize(rows, planned), notRun: notRun.length }, notRun, rows,
       };
       const path = writeReport(values.output ?? `benchmark-results/real-${split}.json`, report);
+      if (values.capture !== undefined) console.log(`Candidate pools: ${writeCapture(values.capture, { kind: 'real', dataset: manifest.version, split, environment: host, settings, pools })}`);
       console.log(JSON.stringify(report.summary, null, 2));
       console.log(`Report: ${path}`);
       if (!sourceStable || notRun.length > 0 || report.summary.overall.incomplete > 0) process.exitCode = 1;

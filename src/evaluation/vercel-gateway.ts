@@ -15,18 +15,9 @@ import {
   type JSONValue,
 } from 'ai';
 
+import { ProviderError, type BatchEvaluation, type EvaluationBatch, type InvalidAnswer, type ProviderClient } from './contracts.ts';
 import {
-  CRITERION_VERSION,
-  LAYOUT_VERSION,
-  ProviderError,
-  RELEVANCE_CRITERION,
-  questionInstructions,
-  parseRetryAfter,
-  inspectResponseKeys,
-  type BatchEvaluation,
-  type EvaluationBatch,
-  type InvalidAnswer,
-  type ProviderClient,
+  CRITERION_VERSION, LAYOUT_VERSION, RELEVANCE_CRITERION, inspectResponseKeys, layoutCriteria, parseRetryAfter, questionInstructions, questionKeys,
 } from './jev.ts';
 import { boundedFetch } from './http.ts';
 
@@ -102,20 +93,21 @@ function buildGatewayInput(batch: EvaluationBatch): {
   state: Readonly<Record<string, string>>;
   questions: Readonly<Record<string, GatewayBooleanQuestion>>;
 } {
+  const criterion = batch.criterion?.text ?? RELEVANCE_CRITERION;
   const questions: Record<string, GatewayBooleanQuestion> = {};
-  for (const item of batch.items) {
-    questions[item.id] = {
-      type: 'boolean',
-      instructions: questionInstructions(item),
-      criteria: { true: RELEVANCE_CRITERION },
-    };
+  const criteria = layoutCriteria(batch);
+  const keys = questionKeys(batch);
+  for (const [index, item] of batch.items.entries()) {
+    questions[keys[index]!] = criteria === undefined
+      ? { type: 'boolean', instructions: questionInstructions(item, batch.layout) }
+      : { type: 'boolean', instructions: questionInstructions(item, batch.layout), criteria };
   }
   return {
     state: {
       search_question: batch.query,
-      criterion: RELEVANCE_CRITERION,
-      criterion_version: CRITERION_VERSION,
-      layout: LAYOUT_VERSION,
+      criterion,
+      criterion_version: batch.criterion?.version ?? CRITERION_VERSION,
+      layout: batch.layout ?? LAYOUT_VERSION,
     },
     questions,
   };
@@ -206,14 +198,16 @@ function normalizeGatewayResult(
 ): BatchEvaluation {
   const scores = new Map<string, number>();
   const invalid: InvalidAnswer[] = [];
-  const requested = new Set(batch.items.map((item) => item.id));
+  const keys = questionKeys(batch);
+  const requested = new Set(keys);
 
-  for (const item of batch.items) {
-    if (!Object.hasOwn(result.answers, item.id)) {
+  for (const [index, item] of batch.items.entries()) {
+    const key = keys[index]!;
+    if (!Object.hasOwn(result.answers, key)) {
       invalid.push({ id: item.id, reason: 'missing' });
       continue;
     }
-    const answer = errorRecord(result.answers[item.id]);
+    const answer = errorRecord(result.answers[key]);
     if (answer?.['type'] !== 'boolean') {
       invalid.push({ id: item.id, reason: 'wrong_type' });
       continue;

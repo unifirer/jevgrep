@@ -7,8 +7,8 @@ import { after, test } from 'node:test';
 import { createSearchEngine } from '../src/engine.ts';
 import type { SearchOutcome } from '../src/contracts.ts';
 import { searchOutcomeSchema } from '../src/contracts.ts';
-import type { BatchEvaluation, EvaluationBatch, ProviderClient } from '../src/evaluation/jev.ts';
-import { MCP_PROTOCOL_VERSION, TOOL_NAME, runMcpServer } from '../src/mcp.ts';
+import type { BatchEvaluation, EvaluationBatch, ProviderClient } from '../src/evaluation/contracts.ts';
+import { MANY_TOOL_NAME, MCP_PROTOCOL_VERSION, TOOL_NAME, runMcpServer } from '../src/mcp.ts';
 import type { Clock } from '../src/lifecycle.ts';
 import { ManualClock } from '../src/testing/manual-clock.ts';
 import { offlineEnv } from './helpers/cli-runner.ts';
@@ -23,6 +23,14 @@ import { createWorkspace, withRemoteEnabled } from './helpers/search-workspace.t
  * stdin closes.
  */
 const spaces: { cleanup(): void }[] = [];
+
+async function until(condition: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const started = Date.now();
+  while (!condition()) {
+    if (Date.now() - started > timeoutMs) throw new Error('condition was not reached');
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
 
 const FILES = {
   'src/cache.ts': 'export function invalidate(userId) {\n  store.delete(userId);\n}\n',
@@ -112,7 +120,7 @@ function session(provider: ProviderClient = new DeterministicProvider(), clock?:
   };
 }
 
-test('the server starts offline, answers initialize and lists exactly one tool', async () => {
+test('the server starts offline, answers initialize and lists the two tools with their output schemas', async () => {
   const active = session();
   active.send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: MCP_PROTOCOL_VERSION } });
   active.send({ jsonrpc: '2.0', method: 'notifications/initialized' });
@@ -127,19 +135,68 @@ test('the server starts offline, answers initialize and lists exactly one tool',
 
   const list = messages.find((message) => message['id'] === 2);
   assert.ok(list !== undefined);
-  const tools = (list['result'] as { tools: { name: string; inputSchema: Record<string, unknown> }[] }).tools;
-  assert.equal(tools.length, 1);
-  assert.equal(tools[0]?.name, TOOL_NAME);
+  const tools = (list['result'] as { tools: { name: string; inputSchema: Record<string, unknown>; outputSchema?: Record<string, unknown> }[] }).tools;
+  assert.deepEqual(tools.map((tool) => tool.name), [TOOL_NAME, MANY_TOOL_NAME]);
+  assert.ok(tools.every((tool) => tool.outputSchema?.['type'] === 'object'));
+});
+
+test('a result carries structuredContent equal to its text block, and progress notifications follow the client token', async () => {
+  let release: () => void = () => {};
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const provider: ProviderClient = {
+    model: 'jev-1.13.0',
+    async evaluateBatch(batch) {
+      await blocked;
+      return {
+        scores: new Map(batch.items.map((item) => [item.id, item.path.includes('cache') ? 0.9 : 0.1])), invalid: [],
+        usage: { inputTokens: 100, outputTokens: 0 }, requestedModel: this.model,
+        returnedModel: this.model, transmittedBytes: 500, requestId: null,
+      };
+    },
+  };
+  const active = session(provider);
+  active.send({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: {
+    name: TOOL_NAME, arguments: { query: 'where is the cache?' }, _meta: { progressToken: 'tok-7' },
+  } });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  release();
+  const messages = await active.responses();
+  const progress = messages.filter((message) => message['method'] === 'notifications/progress')
+    .map((message) => message['params'] as { progressToken: string; progress: number; total?: number; message: string });
+  assert.ok(progress.length >= 1, 'at least one progress notification');
+  assert.ok(progress.every((entry) => entry.progressToken === 'tok-7' && typeof entry.message === 'string'));
+  const last = progress.at(-1)!;
+  assert.ok(last.total !== undefined && last.progress >= last.total, 'the final notification reaches the total');
+  const result = messages.find((message) => message['id'] === 7)?.['result'] as { content: { text: string }[]; structuredContent: unknown; isError: boolean };
+  assert.deepEqual(result.structuredContent, JSON.parse(result.content[0]!.text));
+  assert.equal(result.isError, false);
+});
+
+test('the multiquestion tool answers every question in order, as text blocks and structured results', async () => {
+  const active = session();
+  active.send({ jsonrpc: '2.0', id: 8, method: 'tools/call', params: {
+    name: MANY_TOOL_NAME, arguments: { questions: [{ query: 'where is the cache?' }, { query: 'where is billing?', max_context_tokens: 2_000 }] },
+  } });
+  const messages = await active.responses();
+  const result = messages.find((message) => message['id'] === 8)?.['result'] as {
+    content: { text: string }[]; structuredContent: { results: { status: string; report?: { response_budget: { requested_tokens: number } } }[] }; isError: boolean;
+  };
+  assert.equal(result.content.length, 2);
+  assert.equal(result.structuredContent.results.length, 2);
+  assert.deepEqual(result.structuredContent.results, result.content.map((block) => JSON.parse(block.text)));
+  assert.equal(result.structuredContent.results[1]?.report?.response_budget.requested_tokens, 2_000);
+  assert.equal(result.isError, false);
 });
 
 test('the tool schema cannot change the root, credential, endpoint, model or caps', async () => {
   const active = session();
   active.send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
   const messages = await active.responses();
-  const tools = (messages[0]?.['result'] as { tools: { inputSchema: { properties: Record<string, unknown>; additionalProperties: boolean } }[] }).tools;
+  const tools = (messages[0]!['result'] as { tools: { inputSchema: { properties: Record<string, unknown>; additionalProperties: boolean } }[] }).tools;
   const schema = tools[0]?.inputSchema;
   assert.ok(schema !== undefined);
-  assert.deepEqual(Object.keys(schema.properties).sort(), ['allow_partial_scan', 'max_context_tokens', 'query', 'scope']);
+  assert.deepEqual(Object.keys(schema.properties).sort(),
+    ['allow_partial_scan', 'continuation', 'max_context_tokens', 'max_cost_usd', 'max_input_tokens', 'max_search_ms', 'query', 'scope']);
   assert.equal(schema.additionalProperties, false);
 });
 
@@ -161,8 +218,8 @@ test('a successful call returns one validated JSON payload with isError false', 
   const outcome = searchOutcomeSchema.parse(JSON.parse(result.content[0]?.text ?? '')) as SearchOutcome;
   assert.equal(outcome.status, 'complete');
   assert.ok('report' in outcome && outcome.excerpts.length === 1);
-  assert.equal(Object.hasOwn(call['result'] as object, 'structuredContent'), false,
-    'no structured content is declared without a matching output schema');
+  assert.deepEqual((call['result'] as { structuredContent: unknown }).structuredContent, outcome,
+    'structured content is the same validated payload, under the declared output schema');
 });
 
 test('a rejected outcome uses isError true and stays a bounded payload', async () => {
@@ -187,8 +244,8 @@ test('an unknown tool and an unknown method are protocol errors, not silent succ
   active.send({ jsonrpc: '2.0', id: 6, method: 'ping' });
   const messages = await active.responses();
 
-  assert.ok((messages.find((message) => message['id'] === 4)?.['error'] as { code: number }).code === -32602);
-  assert.ok((messages.find((message) => message['id'] === 5)?.['error'] as { code: number }).code === -32601);
+  assert.ok((messages.find((message) => message['id'] === 4)!['error'] as { code: number }).code === -32602);
+  assert.ok((messages.find((message) => message['id'] === 5)!['error'] as { code: number }).code === -32601);
   assert.deepEqual(messages.find((message) => message['id'] === 6)?.['result'], {});
 });
 
@@ -203,8 +260,8 @@ test('malformed and primitive input return protocol errors without crashing or e
   const messages = await active.responses();
   assert.equal(messages.length, 9);
   assert.deepEqual(messages[0], { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'invalid JSON message' } });
-  assert.equal((messages[1]?.['error'] as { code: number }).code, -32600);
-  assert.equal((messages[7]?.['error'] as { code: number }).code, -32602);
+  assert.equal((messages[1]!['error'] as { code: number }).code, -32600);
+  assert.equal((messages[7]!['error'] as { code: number }).code, -32602);
   assert.deepEqual(messages[8]?.['result'], {});
   assert.ok(!JSON.stringify(messages).includes('malformed-secret'));
 });
@@ -233,6 +290,7 @@ test('one call waits, the third is BUSY, and a queued cancellation frees its slo
     send(1, 'first');
     send('1', 'cancelled queued call');
     send(3, 'too many');
+    await until(() => calls === 1);
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(calls, 1, 'the queued request has not entered the engine');
     active.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: '1' } });
@@ -250,6 +308,38 @@ test('one call waits, the third is BUSY, and a queued cancellation frees its slo
   const busy = messages.find((message) => message['id'] === 3)?.['result'] as { content: { text: string }[] };
   const outcome = JSON.parse(busy.content[0]?.text ?? '{}') as { error: { code: string } };
   assert.equal(outcome.error.code, 'BUSY');
+});
+
+test('closing the input drops the queued call and lets the running one finish', async () => {
+  let calls = 0;
+  let release: () => void = () => {};
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  const provider: ProviderClient = {
+    model: 'jev-1.13.0',
+    async evaluateBatch(batch) {
+      calls += 1;
+      await blocked;
+      return {
+        scores: new Map(batch.items.map((item) => [item.id, 0.9])), invalid: [],
+        usage: { inputTokens: 100, outputTokens: 0 }, requestedModel: this.model,
+        returnedModel: this.model, transmittedBytes: 500, requestId: null,
+      };
+    },
+  };
+  const active = session(provider);
+  const send = (id: number, query: string): void => active.send({
+    jsonrpc: '2.0', id, method: 'tools/call', params: { name: TOOL_NAME, arguments: { query } },
+  });
+  send(1, 'running when the client leaves');
+  send(2, 'queued when the client leaves');
+  await until(() => calls === 1);
+  const closing = active.responses();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  release();
+  const messages = await closing;
+  assert.equal(calls, 1, 'the queued search never reached the provider');
+  assert.ok(messages.some((message) => message['id'] === 1), 'the running call still answered');
+  assert.ok(!messages.some((message) => message['id'] === 2));
 });
 
 test('a cancelled call never produces a later result', async () => {
@@ -306,6 +396,7 @@ test('time spent in the queue consumes the search deadline before any provider d
     params: { name: TOOL_NAME, arguments: { query: `query ${String(id)}` } },
   });
   try {
+    await until(() => calls === 1);
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(calls, 1);
     clock.advanceBy(active.deadlineMs + 1);

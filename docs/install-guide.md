@@ -6,10 +6,14 @@ Vercel AI Gateway or OpenRouter. This guide covers installation, repository auth
 ## Install
 
 Requires Node.js 24 and npm. The package name is `@nassim-arifette/jevgrep`;
-the unscoped package `jevgrep` belongs to a different project. Until the first npm
-release, install from this repository.
+the unscoped package `jevgrep` belongs to a different project.
 
-From this repository:
+```bash
+npm install -g @nassim-arifette/jevgrep
+jevgrep --version
+```
+
+To install a development checkout instead:
 
 ```bash
 git clone https://github.com/nassim-arifette/jevgrep.git
@@ -20,15 +24,11 @@ npm link
 jevgrep --version
 ```
 
-After publication, install it with:
-
-```bash
-npm install -g @nassim-arifette/jevgrep
-```
-
 For development checks, run `npm run verify`. Runtime dependencies are
-`@ai-sdk/gateway`, `ai`, `tiktoken` and `typescript-parser`; exact versions are in
-[package.json](../package.json). The tokenizer vocabulary ships with its package.
+`@ai-sdk/gateway`, `ai`, `tiktoken`, `typescript-parser` and `web-tree-sitter`; exact
+versions are in [package.json](../package.json). The tokenizer vocabulary ships with its
+package, and the Go and Rust Tree-sitter grammars ship as WASM files inside JevGrep, so
+installing runs no native build.
 
 ## Configure a provider
 
@@ -108,8 +108,9 @@ outside the repository, set its absolute `repository_root`, and pass its path us
 
 ## What leaves your machine
 
-Search sends eligible fragment text, your question, relative paths, line ranges and
-the relevance criterion to the configured provider. The evaluation runs remotely.
+Search sends eligible fragment text, your question, relative paths, structure labels
+and the relevance criterion to the configured provider. Line numbers stay local, so
+an unchanged function that moved in its file keeps its cached score. The evaluation runs remotely.
 
 The source policy excludes common credential files, the `.env` family, dependencies,
 build output, generated and minified artifacts, and files containing detected credential
@@ -126,10 +127,11 @@ apply to disclosed content; JevGrep does not promise zero retention.
 | --- | --- | --- |
 | `scan_caps.*` | `null` | optional caps disabled; `0` is a real zero allowance |
 | `search.deadline_ms` | `300000` | five minutes, including preparation and queue wait |
-| `search.concurrency` | `4` | concurrent provider work |
-| `search.default_response_tokens` | `4000` | default response budget |
+| `search.concurrency` | `16` | concurrent provider requests; a large repository scans about 25 % faster at 32 through the Vercel AI Gateway, slower keys may need less |
+| `search.default_response_tokens` | `8000` | default response budget; 4000 returned about three excerpts and left well-scored evidence out (see the [response budget report](../benchmarks/baselines/2026-11-04-response-budget.md)) |
 | `search.max_response_tokens` | `16000` | maximum response budget |
 | `search.threshold` | `0.5` | score threshold for selection |
+| `search.selection_policy` | `relevance` when omitted | order in which qualifying excerpts fill the budget; `mmr` and `marginal` are experimental diversity orders that did not beat `relevance` in the [selection replay](../benchmarks/baselines/2026-11-03-selection-replay.md) |
 | `source.max_file_bytes` | `1048576` | per-file eligibility limit |
 | `source.follow_links` | `false` | `true` is rejected |
 | `cache.ttl_seconds` | `604800` | seven days for pinned models |
@@ -146,7 +148,7 @@ policy. Vercel and OpenRouter model aliases use this short-lived policy.
 Scores from a rolling alias can be stale within its reuse window.
 
 Requests pack fragments by the full serialized token estimate, with provider-specific
-headroom and local question/byte limits. See [request batching](../README.md#request-batching).
+headroom and local question/byte limits. See [request batching](reference.md#request-batching).
 
 Optional `search.retry` settings default to two retries, a 250 ms base delay and a
 5,000 ms maximum jittered delay. `Retry-After` applies across workers. Ambiguous
@@ -165,7 +167,38 @@ jevgrep search --config "/absolute/path/to/config.json" --query "How are permiss
 
 The question file is read verbatim. Scope can narrow authorization, never expand it.
 Add `--allow-partial` to permit a deterministic partial scan when an enabled cap
-would otherwise reject the search.
+would otherwise reject the search. A partial scan prepares and evaluates candidates
+in a local lexical priority order (question terms in the fragment text, file name and
+symbol label), so the evaluated share holds the most likely fragments first; it is
+still reported as partial.
+
+A call can also name its own search budget: `--max-input-tokens <n>` (provider input
+tokens), `--max-cost-usd <usd>` (from the configured pricing) or `--max-search-ms <n>`
+(wall-clock). The MCP tools take the same fields (`max_input_tokens`, `max_cost_usd`,
+`max_search_ms`). A budget never raises an operator cap; when the scope needs more,
+the highest-priority fragments are evaluated first and the result is explicitly
+`partial`, with the coverage counts and a `continuation` token to evaluate the rest.
+An agent can so ask a short question first and continue only when the evidence is
+insufficient.
+
+When fragments were left unevaluated or relevant evidence did not fit the response
+budget, the result carries a continuation token (`continuation.next` in JSON, a
+`continue: --continuation <token>` line in the human view). Run the same query and
+scope with `--continuation <token>` to get the rest: cached scores are reused, only
+the remaining fragments are sent within the same caps, and excerpts delivered earlier
+are not repeated (`continuation.previously_delivered_omitted` counts them). A file
+edited in between is treated as new evidence. The token is refused if the query,
+scope, provider or evaluation policy changed, and it needs the score cache. A
+preparation cap (`candidate_files`, `fragments`, `prepared_source_bytes`) stops at
+the same files again, so narrow the scope instead. MCP clients pass the token as the
+`continuation` argument. Continue only when the evidence so far is not enough.
+
+Repeat `--query` (up to 8 times) to ask several questions over the same scope and
+options in one run. The scope is inventoried and parsed once, and each question gets
+its own result, budget and coverage; with `--json` stdout is `{"results":[...]}` in
+question order. Remote evaluation is paid per question, and a closing line reports
+the provider attempts, estimated tokens and cost across all of them. The exit code is
+the most severe one among the questions. `--continuation` takes a single question.
 
 Exit codes are `0` complete (including an empty selection), `2` invalid request,
 configuration problem or preflight rejection, `3` partial, `4` fatal failure, and
@@ -180,12 +213,12 @@ Set up the provider and repository first. Start the server with an explicit prof
 jevgrep mcp --config "/absolute/path/to/config.json"
 ```
 
-It exposes one tool, `semantic_search_code`, and exits when stdin closes. Startup
+It exposes two tools, `semantic_search_code` (one question) and `semantic_search_code_many` (several questions sharing one preparation), returns each payload as text and as `structuredContent`, sends `notifications/progress` when the call carries a `_meta.progressToken`, and exits when stdin closes. Startup
 does not scan or contact a provider. A tool call uses the same engine and authorization
 as CLI search. Each process serves one repository; use separate server names/profiles
 if configuring several repositories.
 
-See the [README MCP examples](../README.md#use-through-mcp) for Claude Code, Codex and
+See the [README MCP examples](../README.md#connect-your-coding-agent) for Claude Code, Codex and
 clients using JSON configuration. The examples follow the
 [Codex](https://developers.openai.com/codex/mcp) and
 [Claude Code](https://code.claude.com/docs/en/mcp) documentation.

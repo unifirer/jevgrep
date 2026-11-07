@@ -21,11 +21,15 @@ const OPTION_TEXT: Record<string, string> = {
   '--provider': '--provider <name>         typesafe (default), vercel or openrouter',
   '--global': '--global                  configure provider credentials for this computer only',
   '--config': '--config <path>            override automatic project-profile discovery',
-  '--query': '--query <text>             the search question, kept verbatim',
+  '--query': '--query <text>             the search question, kept verbatim; repeat for up to 8 questions over one preparation',
   '--query-file': '--query-file <path>        read the question from a file (multiline queries)',
   '--scope': '--scope <relative path>    repeatable, default ".", never absolute and never traversing',
-  '--max-context-tokens': '--max-context-tokens <n>   response budget in reference tokens (min 1024; configured default/max: initially 4000/16000)',
+  '--max-context-tokens': '--max-context-tokens <n>   response budget in reference tokens (min 1024; configured default/max: initially 8000/16000)',
   '--allow-partial': '--allow-partial            allow a partial scan explicitly (default: refuse)',
+  '--continuation': '--continuation <token>     continue a partial search with the token it printed (same query and scope)',
+  '--max-input-tokens': '--max-input-tokens <n>     search budget in provider input tokens; past it the result is partial, with a continuation',
+  '--max-cost-usd': '--max-cost-usd <usd>       search budget in USD from the configured pricing; same partial semantics',
+  '--max-search-ms': '--max-search-ms <n>        search budget in milliseconds; what was not evaluated in time can be continued',
   '--json': '--json                     canonical JSON on stdout instead of the human view',
 };
 
@@ -33,7 +37,7 @@ const OPTION_TEXT: Record<string, string> = {
 const COMMAND_USAGE: Record<string, string> = {
   init: 'jevgrep init [--global] [--root <path>] [--provider typesafe|vercel|openrouter]',
   search:
-    'jevgrep search [--config <path>] (--query <text> | --query-file <path>) [--scope <path>]... [--max-context-tokens <n>] [--json] [--allow-partial]',
+    'jevgrep search [--config <path>] (--query <text> | --query-file <path>) [--scope <path>]... [--max-context-tokens <n>] [--json] [--allow-partial] [--continuation <token>] [--max-input-tokens <n>] [--max-cost-usd <usd>] [--max-search-ms <n>]',
   inspect: 'jevgrep inspect [--config <path>] [--scope <path>]... [--json]',
   doctor: 'jevgrep doctor [--config <path>]',
   mcp: 'jevgrep mcp [--config <path>]',

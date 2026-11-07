@@ -10,7 +10,8 @@ import type { CommandDependencies } from '../src/cli-commands.ts';
 import type { CliIo } from '../src/cli.ts';
 import { createSearchEngine } from '../src/engine.ts';
 import { ScoreCache } from '../src/evaluation/cache.ts';
-import type { BatchEvaluation, EvaluationBatch, ProviderClient } from '../src/evaluation/jev.ts';
+import type { BatchEvaluation, EvaluationBatch, ProviderClient } from '../src/evaluation/contracts.ts';
+import { estimateInputCostUsd } from '../src/pricing.ts';
 import { CLI_EXIT_CODES } from '../src/search-response.ts';
 import { preparationCacheDirectory } from '../src/source/preparation-cache.ts';
 import { createWorkspace, withRemoteEnabled } from './helpers/search-workspace.ts';
@@ -131,6 +132,59 @@ test('inspect reports scope, exclusions, fragments and estimates without a provi
   assert.ok(report.estimates.requests >= 1);
 });
 
+test('inspect estimates USD with the same nanodollar policy as a search', async () => {
+  const space = workspace((config) => ({
+    ...withRemoteEnabled(config),
+    provider: {
+      ...config.provider,
+      pricing: { model: config.provider.model, verified_at: '2026-09-20', input_usd_per_million_tokens: 0.15, output_usd_per_million_tokens: 0 },
+    },
+  }));
+  const captured = capture();
+  const code = await executeCommand(
+    parsed(['inspect', '--config', space.configPath, '--json']), captured.io, dependencies(space),
+  );
+  assert.equal(code, CLI_EXIT_CODES.complete, captured.err.join(''));
+  const report = JSON.parse(captured.out.join('')) as { estimates: { input_tokens: number; cost_usd: number | null } };
+  assert.ok(report.estimates.input_tokens > 0);
+  assert.equal(report.estimates.cost_usd, estimateInputCostUsd(report.estimates.input_tokens, 0.15));
+});
+
+test('inspect warns before a search that an enabled cap would refuse a cold scan', async () => {
+  const space = workspace((config) => ({
+    ...withRemoteEnabled(config), scan_caps: { ...config.scan_caps, transmitted_bytes: 1, request_attempts: 1_000 },
+  }));
+  const provider = new CountingProvider();
+  const inspected = capture();
+  const code = await executeCommand(
+    parsed(['inspect', '--config', space.configPath, '--json']), inspected.io, dependencies(space, provider),
+  );
+  assert.equal(code, CLI_EXIT_CODES.complete, inspected.err.join(''));
+  const report = JSON.parse(inspected.out.join('')) as {
+    scan_caps: { enabled: Record<string, number>; required: Record<string, number | null>; exceeded: string[] };
+    estimates: { requests: number }; notes: string[];
+  };
+  assert.deepEqual(report.scan_caps.enabled, { request_attempts: 1_000, transmitted_bytes: 1 });
+  assert.equal(report.scan_caps.required['request_attempts'], report.estimates.requests);
+  assert.ok((report.scan_caps.required['transmitted_bytes'] ?? 0) > 1);
+  assert.deepEqual(report.scan_caps.exceeded, ['transmitted_bytes']);
+  assert.ok(report.notes.some((note) => note.includes('would be refused before any provider request')));
+
+  const searched = capture();
+  await executeCommand(parsed(['search', '--config', space.configPath, '--query', 'cache invalidation', '--json']),
+    searched.io, dependencies(space, provider));
+  const result = JSON.parse(searched.out.join('')) as { status: string; report: { stop_reasons: string[] } };
+  assert.equal(result.status, 'rejected', 'the search agrees with the inspect verdict');
+  assert.ok(result.report.stop_reasons.includes('SCOPE_EXCEEDS_SCAN_BUDGET'));
+  assert.equal(provider.calls, 0);
+
+  const human = capture();
+  await executeCommand(parsed(['inspect', '--config', space.configPath]), human.io, dependencies(space));
+  const text = human.out.join('\n');
+  assert.match(text, /scan caps {10}request_attempts: \d+ of 1000 \(fits\)/);
+  assert.match(text, /transmitted_bytes: \d+ of 1 \(EXCEEDED\)/);
+});
+
 test('the human inspect rendering names what it could not count', async () => {
   const space = workspace();
   const captured = capture();
@@ -138,6 +192,7 @@ test('the human inspect rendering names what it could not count', async () => {
   const text = captured.out.join('\n');
   assert.ok(text.includes('cache hits         unknown without a search question'));
   assert.ok(text.includes('estimated cost     unknown'));
+  assert.ok(text.includes('scan caps          none enabled'));
   assert.ok(/excluded by reason|excluded         none/.test(text));
 });
 
@@ -303,4 +358,24 @@ test('a search without remote evaluation is refused before any dispatch', async 
   assert.equal(code, CLI_EXIT_CODES.rejected);
   const payload = JSON.parse(captured.out[0] ?? '') as { error: { code: string } };
   assert.equal(payload.error.code, 'REMOTE_DISABLED');
+});
+
+test('several --query options run as separate results with per-question cost totals', async () => {
+  const space = workspace();
+  const provider = new CountingProvider();
+  const json = capture();
+  const code = await executeCommand(parsed(['search', '--config', space.configPath, '--query', 'cache invalidation', '--query', 'version', '--json']),
+    json.io, dependencies(space, provider));
+  assert.equal(code, CLI_EXIT_CODES.complete);
+  const body = JSON.parse(json.out.join('')) as { results: { status: string; excerpts: { path: string }[] }[] };
+  assert.deepEqual(body.results.map((result) => result.status), ['complete', 'complete']);
+  assert.deepEqual(body.results[0]?.excerpts.map((excerpt) => excerpt.path), ['src/cache.ts']);
+  assert.equal(provider.calls, 2);
+  assert.match(json.err.join('\n'), /2 questions, one shared preparation; remote evaluation is paid per question: 2 provider attempts/);
+  const human = capture();
+  await executeCommand(parsed(['search', '--config', space.configPath, '--query', 'where?', '--query', 'what?']), human.io, dependencies(space, provider));
+  const text = human.out.join('\n');
+  assert.match(text, /== question 1 of 2: where\?/);
+  assert.match(text, /== question 2 of 2: what\?/);
+  assert.match(text, /2 questions, one shared preparation/);
 });

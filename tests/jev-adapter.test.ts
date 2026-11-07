@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import {
-  CRITERION_VERSION, JevAdapter, LAYOUT_VERSION, ProviderError, RELEVANCE_CRITERION,
-  buildRequestPayload, duplicateAnswerKeys, fetchTransport, fitsProviderLimits, normalizeResponse,
-} from '../src/evaluation/jev.ts';
-import type { EvaluationBatch, TransportRequest, TransportResponse } from '../src/evaluation/jev.ts';
+import { ProviderError } from '../src/evaluation/contracts.ts';
+import { fetchTransport } from '../src/evaluation/http.ts';
+import { CRITERION_VERSION, JevAdapter, LAYOUT_VERSION, RELEVANCE_CRITERION, buildRequestPayload, duplicateAnswerKeys, fitsProviderLimits, normalizeResponse } from '../src/evaluation/jev.ts';
+import type { EvaluationBatch } from '../src/evaluation/contracts.ts';
+import type { TransportRequest, TransportResponse } from '../src/evaluation/http.ts';
 
 /**
  * Jev adapter contract (JG-013, specification 6.2 and 6.3).
@@ -19,6 +19,7 @@ import type { EvaluationBatch, TransportRequest, TransportResponse } from '../sr
 
 const BATCH: EvaluationBatch = {
   query: 'Which handler invalidates cached user data?',
+  layout: 'layout-a-1',
   items: [
     { id: 'f-one', path: 'src/cache.ts', startLine: 1, endLine: 12, text: 'export function invalidate() {}\n', label: 'function:invalidate' },
     { id: 'f-two', path: 'src/handler.ts', startLine: 4, endLine: 20, text: 'export function handle() {}\n', label: null },
@@ -52,12 +53,12 @@ test('the request carries the versioned criterion, the excerpt and its location 
   assert.equal(payload.state.search_question, BATCH.query);
   assert.equal(payload.state.criterion, RELEVANCE_CRITERION);
   assert.equal(payload.state.criterion_version, CRITERION_VERSION);
-  assert.equal(payload.state.layout, LAYOUT_VERSION);
+  assert.equal(payload.state.layout, 'layout-a-1');
   assert.deepEqual(Object.keys(payload.questions), ['f-one', 'f-two']);
   const first = payload.questions['f-one'];
   assert.ok(first !== undefined);
   assert.equal(first.type, 'noul');
-  assert.equal(first.criteria.true, RELEVANCE_CRITERION);
+  assert.equal(first.criteria?.true, RELEVANCE_CRITERION);
   assert.ok(first.instructions.includes('src/cache.ts'));
   assert.ok(first.instructions.includes('Lines: 1-12'));
   assert.ok(first.instructions.includes('export function invalidate()'));
@@ -284,4 +285,20 @@ test('a batch beyond the documented provider context is detected locally', () =>
     items: [{ id: 'big', path: 'src/big.ts', startLine: 1, endLine: 2, text: 'x '.repeat(200_000), label: null }],
   };
   assert.equal(fitsProviderLimits(huge, 'jev-1.13.0'), false);
+});
+
+test('the default layout keys questions by position and maps answers back to fragments', async () => {
+  const lineFree = { query: BATCH.query, items: BATCH.items };
+  const payload = buildRequestPayload(lineFree, 'jev-1.13.0');
+  assert.equal(payload.state.layout, LAYOUT_VERSION);
+  assert.deepEqual(Object.keys(payload.questions), ['e1', 'e2']);
+  const body = JSON.stringify(payload);
+  assert.ok(!body.includes('Lines:') && !body.includes('f-one'), 'no line range or line-bearing id reaches the model');
+  const result = await adapterWith([jsonResponse({
+    model: 'jev-1.13.0',
+    answers: { e2: { type: 'noul', noul: 0.2 }, e1: { type: 'noul', noul: 0.9 } },
+    usage: { input_tokens: 10, output_tokens: 0 },
+  })]).evaluateBatch(lineFree);
+  assert.deepEqual([...result.scores].sort(), [['f-one', 0.9], ['f-two', 0.2]]);
+  assert.deepEqual(result.invalid, []);
 });
